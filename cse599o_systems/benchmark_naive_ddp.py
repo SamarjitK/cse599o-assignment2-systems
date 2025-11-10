@@ -22,7 +22,7 @@ import argparse
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from cse599o_basics.optimizer import AdamW
+from cse599o_basics.adamw import AdamW
 from tests.common import ToyModel
 
 # Any necessary helper functions can be defined here.
@@ -30,8 +30,7 @@ from tests.common import ToyModel
 # You can change the function and variable names as needed.
 def run_naive_ddp_worker(rank, world_size, data, num_steps, result_queue):
     """Run one DDP worker process."""
-    # TODO
-    pass
+    
     if rank == 0:
         # TODO: Collect and return the model state from rank 0
         result_queue.put({})  # Replace with actual model state
@@ -39,8 +38,22 @@ def run_naive_ddp_worker(rank, world_size, data, num_steps, result_queue):
 # You can change the function and variable names as needed.
 def run_baseline(data, num_steps):
     """Run single-process baseline for comparison."""
-    # TODO
-    return {}  # Replace with actual model state
+    model = ToyModel()
+    optim_args = {
+        "lr": 1e-3,
+        "weight_decay": 0.01,
+        "betas": (0.9, 0.999),
+        "eps": 1e-8
+    }
+    optim = AdamW(model.parameters(), **optim_args)
+    for _ in range(num_steps):
+        optim.zero_grad()
+        output = model(data)
+        loss = output.sum()
+        loss.backward()
+        optim.step()
+
+    return model.state_dict()
 
 # You can change the function and variable names as needed.
 def verify_naive_ddp():
