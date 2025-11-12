@@ -28,6 +28,7 @@ from cse599o_basics.adamw import AdamW
 from cse599o_basics.model_utils import cross_entropy
 from cse599o_basics.transformer_lm import TransformerLM
 from cse599o_basics.tokenizer import BPETokenizer
+from cse599o_systems.ddp import DDP, DDPBucketed
 
 # Any necessary helper functions can be defined here.
 def calculate_elapsed_time(start_events, end_events, num_iters):
@@ -210,20 +211,107 @@ def run_flat(model, data, optimizer, num_iters, num_warmup, iteration_times, com
 # (2) Individual DDP
 # ============================================================
 # You can change the function and variable names as needed.
+def individual_worker(rank, world_size, model, data, optimizer, num_iters, num_warmup, result_queue):
+    setup(rank, world_size)
+
+    model = DDP(model.to(f"cuda:{rank}"))
+
+    input, labels = data
+    assert input.size(0) % world_size == 0, "d doesn't divide n"
+    input = torch.chunk(input, world_size, dim=0)[rank].to(f"cuda:{rank}")
+    labels = torch.chunk(labels, world_size, dim=0)[rank].to(f"cuda:{rank}")
+
+
+    total_starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    total_ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+
+    for i in range(num_iters + num_warmup):
+        iter = i - num_warmup
+        if i >= num_warmup:
+            total_starts[iter].record()
+        optimizer.zero_grad()
+        output = model(input)
+        loss = cross_entropy(output, labels)
+        loss.backward()
+        model.finish_gradient_synchronization()
+        optimizer.step()
+        if i >= num_warmup:
+            total_ends[iter].record()
+        torch.cuda.synchronize()
+
+    avg_total_time = calculate_elapsed_time(total_starts, total_ends, num_iters)
+    result_queue.put(avg_total_time)
+    cleanup()
+
 def run_individual(model, data, optimizer, num_iters, num_warmup, iteration_times, comm_times):
     """All-reduce each parameter's gradient individually."""
-    # TODO:
-    pass
+    manager = mp.Manager()
+    result_queue = manager.Queue()
+    world_size = 2
+    
+    mp.spawn(
+        individual_worker,
+        args=(world_size, model, data, optimizer, num_iters, num_warmup, result_queue),
+        nprocs=world_size,
+        join=True,
+    )
+
+    for _ in range(world_size):
+        iteration_times.append(result_queue.get())
 
 
 # ============================================================
 # (3) Bucketed DDP
 # ============================================================
+
+def bucketed_worker(rank, world_size, model, data, optimizer, num_iters, num_warmup, bucket_mb, result_queue):
+    setup(rank, world_size)
+
+    model = DDPBucketed(model.to(f"cuda:{rank}"), bucket_mb)
+
+    input, labels = data
+    assert input.size(0) % world_size == 0, "d doesn't divide n"
+    input = torch.chunk(input, world_size, dim=0)[rank].to(f"cuda:{rank}")
+    labels = torch.chunk(labels, world_size, dim=0)[rank].to(f"cuda:{rank}")
+
+
+    total_starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    total_ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+
+    for i in range(num_iters + num_warmup):
+        iter = i - num_warmup
+        if i >= num_warmup:
+            total_starts[iter].record()
+        optimizer.zero_grad()
+        output = model(input)
+        loss = cross_entropy(output, labels)
+        loss.backward()
+        model.finish_gradient_synchronization()
+        optimizer.step()
+        if i >= num_warmup:
+            total_ends[iter].record()
+        torch.cuda.synchronize()
+
+    avg_total_time = calculate_elapsed_time(total_starts, total_ends, num_iters)
+    result_queue.put(avg_total_time)
+    cleanup()
+
 # You can change the function and variable names as needed.
 def run_bucketed(model, data, optimizer, num_iters, num_warmup, iteration_times, comm_times, bucket_mb):
     """Group gradients into buckets and all-reduce each bucket."""
-    # TODO:
-    pass
+    manager = mp.Manager()
+    result_queue = manager.Queue()
+    world_size = 2
+    
+    mp.spawn(
+        bucketed_worker,
+        args=(world_size, model, data, optimizer, num_iters, num_warmup, bucket_mb, result_queue),
+        nprocs=world_size,
+        join=True,
+    )
+
+    for _ in range(world_size):
+        iteration_times.append(result_queue.get())
 
 
 # ============================================================
