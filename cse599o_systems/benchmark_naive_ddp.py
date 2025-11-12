@@ -54,7 +54,7 @@ def run_naive_ddp_worker(rank, world_size, data, num_steps, result_queue, model,
         "eps": 1e-8
     }
 
-    if model_params: # this is just for verification, since we need to match baseline
+    if rank == 0 and model_params: # this is just for verification, since we need to match baseline
         model.load_state_dict(model_params)
 
     # send params from rank 0 to all others
@@ -67,23 +67,53 @@ def run_naive_ddp_worker(rank, world_size, data, num_steps, result_queue, model,
     input = torch.chunk(input, world_size, dim=0)[rank].to(f"cuda:{rank}")
     labels = torch.chunk(labels, world_size, dim=0)[rank].to(f"cuda:{rank}")
 
-    for _ in range(num_steps):
+    # need to measure total training time per iteration
+    # and fraction of time spent on gradient communication
+    total_starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_steps)]
+    total_ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_steps)]
+    comm_starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_steps)]
+    comm_ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_steps)]
+
+    for i in range(num_steps):
+        total_starts[i].record()
         optim.zero_grad()
         output = model(input)
         loss = cross_entropy(output, labels)
         loss.backward()
 
         # all-reduce to average loss gradients
+        comm_starts[i].record()
         for param in model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+        comm_ends[i].record()
+        torch.cuda.synchronize()
+
+        # going to divide separately so I'm sure it's not included in comm time
+        for param in model.parameters():
+            if param.grad is not None:
                 param.grad.data /= world_size
 
         optim.step()
+        total_ends[i].record()
+        torch.cuda.synchronize()
 
-    if rank == 0:
-        state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        result_queue.put(state)
+    if model_params:
+        if rank == 0:
+            state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            result_queue.put(state)
+    else: # we're doing timing benchmark
+        total_times = []
+        comm_times = []
+        torch.cuda.synchronize()
+        for i in range(num_steps):
+            total_time = total_starts[i].elapsed_time(total_ends[i])  # in milliseconds
+            comm_time = comm_starts[i].elapsed_time(comm_ends[i])  # in milliseconds
+            total_times.append(total_time)
+            comm_times.append(comm_time)
+        avg_total_time = sum(total_times) / num_steps
+        avg_comm_time = sum(comm_times) / num_steps
+        result_queue.put((avg_total_time, avg_comm_time))
     cleanup()
 
 # You can change the function and variable names as needed.
@@ -185,6 +215,20 @@ def timing_naive_ddp():
         nprocs=world_size,
         join=True,
     )
+
+    # each process will put its timing results in the queue
+    total_times = []
+    comm_times = []
+    for _ in range(world_size):
+        avg_total_time, avg_comm_time = result_queue.get()
+        # also print raw data for testing
+        print(f"GPU {_}: Average Step Time: {avg_total_time:.2f} ms, Average Comm Time: {avg_comm_time:.2f} ms")
+        total_times.append(avg_total_time)
+        comm_times.append(avg_comm_time)
+    print(f"Naive DDP Transformer Benchmark over {num_steps} steps with {world_size} GPUs:")
+    print(f"Average Step Time per GPU: {sum(total_times)/world_size:.2f} ms")
+    print(f"Average Communication Time per GPU: {sum(comm_times)/world_size:.2f} ms")
+    print(f"Fraction of Time in Communication: {sum(comm_times)/sum(total_times)*100:.2f} %")
     
 
 if __name__ == "__main__":

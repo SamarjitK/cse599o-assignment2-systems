@@ -22,8 +22,21 @@ import argparse
 import torch
 import torch.distributed as dist
 # Any other necessary imports can be added here.
+import os
+import torch.multiprocessing as mp
+from cse599o_basics.adamw import AdamW
+from cse599o_basics.model_utils import cross_entropy
+from cse599o_basics.transformer_lm import TransformerLM
+from cse599o_basics.tokenizer import BPETokenizer
 
 # Any necessary helper functions can be defined here.
+def calculate_elapsed_time(start_events, end_events, num_iters):
+    times = []
+    for i in range(num_iters):
+        time = start_events[i].elapsed_time(end_events[i])  # in milliseconds
+        times.append(time)
+    avg_time = sum(times) / num_iters
+    return avg_time
 
 # You can change the function and variable names as needed.
 def setup(rank, world_size):
@@ -32,23 +45,165 @@ def setup(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
+def cleanup():
+    dist.destroy_process_group()
+
 # ============================================================
 # (0) Naive DDP
 # ============================================================
+def naive_worker(rank, world_size, model, data, optimizer, num_iters, num_warmup, result_queue):
+    setup(rank, world_size)
+
+    model = model.to(f"cuda:{rank}")
+
+    input, labels = data
+    assert input.size(0) % world_size == 0, "d doesn't divide n"
+    input = torch.chunk(input, world_size, dim=0)[rank].to(f"cuda:{rank}")
+    labels = torch.chunk(labels, world_size, dim=0)[rank].to(f"cuda:{rank}")
+
+
+    total_starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    total_ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    comm_starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    comm_ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+
+    for i in range(num_iters + num_warmup):
+        iter = i - num_warmup
+        if i >= num_warmup:
+            total_starts[iter].record()
+        optimizer.zero_grad()
+        output = model(input)
+        loss = cross_entropy(output, labels)
+        loss.backward()
+
+        # all-reduce to average loss gradients
+        if i >= num_warmup:
+            comm_starts[iter].record()
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+        if i >= num_warmup:
+            comm_ends[iter].record()
+        torch.cuda.synchronize()
+
+        # going to divide separately so I'm sure it's not included in comm time
+        for param in model.parameters():
+            if param.grad is not None:
+                param.grad.data /= world_size
+
+        optimizer.step()
+        if i >= num_warmup:
+            total_ends[iter].record()
+        torch.cuda.synchronize()
+
+    avg_total_time = calculate_elapsed_time(total_starts, total_ends, num_iters)
+    avg_comm_time = calculate_elapsed_time(comm_starts, comm_ends, num_iters)
+    result_queue.put((avg_total_time, avg_comm_time))
+    cleanup()
+
 # You can change the function and variable names as needed.
 def run_naive(model, data, optimizer, num_iters, num_warmup, iteration_times, comm_times):
     """A naive DDP training loop for reference."""
-    # TODO:
-    pass
+    manager = mp.Manager()
+    result_queue = manager.Queue()
+    world_size = 2
+    
+    mp.spawn(
+        naive_worker,
+        args=(world_size, model, data, optimizer, num_iters, num_warmup, result_queue),
+        nprocs=world_size,
+        join=True,
+    )
+
+    for _ in range(world_size):
+        iter_time, comm_time = result_queue.get()
+        iteration_times.append(iter_time)
+        comm_times.append(comm_time)
+
 
 # ============================================================
 # (1) Flat DDP
 # ============================================================
+
+def flat_worker(rank, world_size, model, data, optimizer, num_iters, num_warmup, result_queue):
+    setup(rank, world_size)
+
+    model = model.to(f"cuda:{rank}")
+
+    input, labels = data
+    assert input.size(0) % world_size == 0, "d doesn't divide n"
+    input = torch.chunk(input, world_size, dim=0)[rank].to(f"cuda:{rank}")
+    labels = torch.chunk(labels, world_size, dim=0)[rank].to(f"cuda:{rank}")
+
+
+    total_starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    total_ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    comm_starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    comm_ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+
+    total_elements = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    flat_grads = torch.zeros(total_elements, device=f"cuda:{rank}")
+
+    for i in range(num_iters + num_warmup):
+        iter = i - num_warmup
+        if i >= num_warmup:
+            total_starts[iter].record()
+        optimizer.zero_grad()
+        output = model(input)
+        loss = cross_entropy(output, labels)
+        loss.backward()
+
+        # all-reduce to average loss gradients
+        offset = 0
+        for param in model.parameters():
+            if param.grad is not None:
+                numel = param.grad.data.numel()
+                flat_grads[offset:offset + numel].copy_(param.grad.data.view(-1))
+                offset += numel
+
+        if i >= num_warmup:
+            comm_starts[iter].record()
+        dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
+        if i >= num_warmup:
+            comm_ends[iter].record()
+        torch.cuda.synchronize()
+
+        flat_grads /= world_size
+        offset = 0
+        for param in model.parameters():
+            if param.grad is not None:
+                numel = param.grad.data.numel()
+                param.grad.data.copy_(flat_grads[offset:offset + numel].view_as(param.grad.data))
+                offset += numel
+
+        optimizer.step()
+        if i >= num_warmup:
+            total_ends[iter].record()
+        torch.cuda.synchronize()
+
+    avg_total_time = calculate_elapsed_time(total_starts, total_ends, num_iters)
+    avg_comm_time = calculate_elapsed_time(comm_starts, comm_ends, num_iters)
+    result_queue.put((avg_total_time, avg_comm_time))
+    cleanup()
+
 # You can change the function and variable names as needed.
 def run_flat(model, data, optimizer, num_iters, num_warmup, iteration_times, comm_times):
     """All-reduce a single flattened gradient tensor."""
-    # TODO:
-    pass
+    manager = mp.Manager()
+    result_queue = manager.Queue()
+    world_size = 2
+    
+    mp.spawn(
+        flat_worker,
+        args=(world_size, model, data, optimizer, num_iters, num_warmup, result_queue),
+        nprocs=world_size,
+        join=True,
+    )
+
+    for _ in range(world_size):
+        iter_time, comm_time = result_queue.get()
+        iteration_times.append(iter_time)
+        comm_times.append(comm_time)
 
 
 # ============================================================
@@ -82,7 +237,7 @@ def benchmark_optimized_ddp():
         "--mode",
         type=str,
         default="flat",
-        choices=["flat", "individual", "bucketed"],
+        choices=["flat", "individual", "bucketed", "naive"],
         help="Select which DDP variant to benchmark.",
     )
     parser.add_argument(
@@ -99,15 +254,42 @@ def benchmark_optimized_ddp():
     
     # DDP setup
     # TODO: Initialize distributed process group
+    mp.set_start_method("spawn", force=True)
+    world_size = 2
 
     # Construct model and move to GPU
     # TODO: Define model parameters
+    vocab_size = 5
+    model_args = {
+        "vocab_size": vocab_size,
+        "context_length": 4,
+        "num_layers": 36,
+        "d_model": 1280,
+        "num_heads": 20,
+        "d_ff": 5120,
+        "rope_theta": 10000.0
+    }
+    model = TransformerLM(**model_args)
+    
 
     # Construct optimizer
     # TODO: Define optimizer
+    optim_args = {
+        "lr": 1e-3,
+        "weight_decay": 0.01,
+        "betas": (0.9, 0.999),
+        "eps": 1e-8
+    }
+    optimizer = AdamW(model.parameters(), **optim_args)
     
     # Dummy data
     # TODO: Create input data
+    batch_size = 4 * world_size
+    seq_length = model_args["context_length"]
+    data = ( # input, labels
+        torch.randint(0, vocab_size, (batch_size, seq_length)),
+        torch.randint(0, vocab_size, (batch_size, seq_length))
+    )
 
     if args.mode == "naive":
         run_naive(model, data, optimizer, num_iters, num_warmup, iteration_times, comm_times)
@@ -122,6 +304,7 @@ def benchmark_optimized_ddp():
     print(f"Iteration times: {iteration_times}")
     print(f"Communication times: {comm_times}")
 
+    print(f"Average percentage of time spent in communication: {sum(comm_times)/sum(iteration_times)*100:.2f} %")
 
 if __name__ == "__main__":
     benchmark_optimized_ddp()
