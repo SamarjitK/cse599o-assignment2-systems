@@ -24,6 +24,7 @@ import torch.distributed as dist
 # Any other necessary imports can be added here.
 import os
 import torch.multiprocessing as mp
+import torch.cuda.nvtx as nvtx
 from cse599o_basics.adamw import AdamW
 from cse599o_basics.model_utils import cross_entropy
 from cse599o_basics.transformer_lm import TransformerLM
@@ -152,7 +153,11 @@ def flat_worker(rank, world_size, model, data, optimizer, num_iters, num_warmup,
         optimizer.zero_grad()
         output = model(input)
         loss = cross_entropy(output, labels)
+        if i >= num_warmup:
+            nvtx.range_push("Computation")
         loss.backward()
+        if i >= num_warmup:
+            nvtx.range_pop()
 
         # all-reduce to average loss gradients
         offset = 0
@@ -164,8 +169,10 @@ def flat_worker(rank, world_size, model, data, optimizer, num_iters, num_warmup,
 
         if i >= num_warmup:
             comm_starts[iter].record()
+            nvtx.range_push("Communication")
         dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
         if i >= num_warmup:
+            nvtx.range_pop()
             comm_ends[iter].record()
         torch.cuda.synchronize()
 
